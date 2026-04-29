@@ -10,118 +10,88 @@ export const config = {
 };
 
 const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
-const SPEED_LIMIT_BYTES_PER_SEC = 240 * 1024; // 120 KB/s = ~1 مگابیت (خیلی پایین‌تر از 8)
+const SPEED_LIMIT_BYTES = 120 * 1024; // 120 KB/s - برای کمترین مصرف
 
 const STRIP_HEADERS = new Set([
-  "host", "connection", "keep-alive",
-  "proxy-authenticate", "proxy-authorization", "te", "trailer",
-  "transfer-encoding", "upgrade", "forwarded", "x-forwarded-host",
-  "x-forwarded-proto", "x-forwarded-port",
+  "host",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "forwarded",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-forwarded-port",
 ]);
 
-// کلاس محدودکننده سرعت خیلی ساده
-class SlowStream extends Readable {
-  constructor(source, speedBytesPerSec) {
-    super();
-    this.source = source;
-    self.speedBytesPerSec = speedBytesPerSec;
-    this.chunkDelayMs = 100; // هر ۱۰۰ میلی‌ثانیه
-    this.bytesPerChunk = Math.floor(speedBytesPerSec * (this.chunkDelayMs / 1000));
-    self.bytesPerChunk = this.bytesPerChunk;
-    self.buffer = [];
-    self.source.on('data', (chunk) => {
-      self.buffer.push(chunk);
-      self._sendSlowly();
-    });
-    self.source.on('end', () => self.push(null));
-    self.source.on('error', (err) => self.destroy(err));
-    self.sending = false;
+// تابع محدودکننده سرعت - فقط همینه، بقیه چیزا دست نمیخوره
+async function slowPipeline(source, dest, speedBps) {
+  for await (const chunk of source) {
+    const chunkSize = chunk.length;
+    const delayMs = (chunkSize / speedBps) * 1000;
+    dest.write(chunk);
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
   }
-
-  _sendSlowly() {
-    if (self.sending || self.buffer.length === 0) return;
-    self.sending = true;
-    
-    const chunk = self.buffer.shift();
-    let offset = 0;
-    
-    const sendChunk = () => {
-      const toSend = chunk.slice(offset, offset + self.bytesPerChunk);
-      if (toSend.length === 0) {
-        self.sending = false;
-        self._sendSlowly();
-        return;
-      }
-      offset += toSend.length;
-      self.push(toSend);
-      setTimeout(sendChunk, self.chunkDelayMs);
-    };
-    
-    sendChunk();
-  }
-
-  _read() {}
+  dest.end();
 }
 
 export default async function handler(req, res) {
-  // فقط اجازه GET و روش‌های سبک
-  if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'POST') {
-    res.statusCode = 405;
-    return res.end("Method Not Allowed");
-  }
-
   if (!TARGET_BASE) {
     res.statusCode = 500;
-    return res.end("Misconfigured: TARGET_DOMAIN not set");
+    return res.end("Misconfigured: TARGET_DOMAIN is not set");
   }
 
   try {
     const targetUrl = TARGET_BASE + req.url;
 
-    // هدرهای خیلی کم (حداقلی)
-    const headers = { "user-agent": "vercel-relay" };
+    const headers = {};
     let clientIp = null;
-    
     for (const key of Object.keys(req.headers)) {
       const k = key.toLowerCase();
+      const v = req.headers[key];
       if (STRIP_HEADERS.has(k)) continue;
       if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip" || k === "x-forwarded-for") {
-        if (!clientIp) clientIp = req.headers[key];
-        continue;
-      }
-      // فقط هدرهای ضروری رو نگه دار
-      if (k === "accept" || k === "accept-encoding" || k === "content-type") {
-        headers[k] = req.headers[key];
-      }
+      if (k === "x-real-ip") { clientIp = v; continue; }
+      if (k === "x-forwarded-for") { if (!clientIp) clientIp = v; continue; }
+      headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     if (clientIp) headers["x-forwarded-for"] = clientIp;
 
-    const upstream = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      redirect: "manual"
-    });
+    const method = req.method;
+    const hasBody = method !== "GET" && method !== "HEAD";
 
-    res.statusCode = upstream.status;
-    
-    // فقط هدرهای ضروری رو بفرست
-    const essentialHeaders = ["content-type", "location", "www-authenticate"];
-    for (const k of essentialHeaders) {
-      const v = upstream.headers.get(k);
-      if (v) res.setHeader(k, v);
+    const fetchOpts = { method, headers, redirect: "manual" };
+    if (hasBody) {
+      fetchOpts.body = Readable.toWeb(req);
+      fetchOpts.duplex = "half";
     }
 
-    if (upstream.body && upstream.headers.get("content-length") !== "0") {
-      const slowStream = new SlowStream(Readable.fromWeb(upstream.body), SPEED_LIMIT_BYTES_PER_SEC);
-      await pipeline(slowStream, res);
+    const upstream = await fetch(targetUrl, fetchOpts);
+
+    res.statusCode = upstream.status;
+    for (const [k, v] of upstream.headers) {
+      if (k.toLowerCase() === "transfer-encoding") continue;
+      try { res.setHeader(k, v); } catch {}
+    }
+
+    if (upstream.body) {
+      // تنها جایی که تغییر کرده - استفاده از slowPipeline به جای pipeline مستقیم
+      const webStream = upstream.body;
+      const nodeStream = Readable.fromWeb(webStream);
+      await slowPipeline(nodeStream, res, SPEED_LIMIT_BYTES);
     } else {
       res.end();
     }
-  } catch {
+  } catch (err) {
     if (!res.headersSent) {
       res.statusCode = 502;
-      res.end("Tunnel Failed");
+      res.end("Bad Gateway: Tunnel Failed");
     }
   }
 }
